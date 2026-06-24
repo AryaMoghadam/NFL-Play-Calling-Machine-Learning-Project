@@ -1,0 +1,2370 @@
+---
+title: "PSTAT 131 Final Project"
+author: "Arya Moghadam"
+output: 
+  html_document:
+  toc: true
+  toc_float: true
+  toc_depth: 3
+  theme: flatly
+date: "2026-03-11"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+![](images/Football%20Field%20Play%20Calling.jpg){width="540"}
+
+# Introduction:
+
+My goal for this project is to build a machine learning model based on
+NFL play calling and how it can decide the outcome of the game for the
+team that decides to do that specific play call. We will be using NFL
+play calling data from "nflfastr", specifically looking at the 2025-2026
+season. I wanted to strictly focus on just this season because of time
+constraints with building the project and mostly because I wanted to see
+if it functions well with data from just one season compared to
+multiple.
+
+Below us we load in the packages and set up our environment.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{R}
+#Libraries that I used
+library(tidyverse) #primarily utilized tidyverse and tidymodels
+library(tidymodels)
+library(ggplot2) #Used for our EDA visualizations
+library(scales) #Used to cleanly format plot axes 
+library(recipes) #Used to build the data preprocessing pipeline
+library(ranger) #The high performance engine to build the random forest
+library(kknn) #The engine used to run the K-Nearest Neighbors model
+library(dplyr) #Used for data manipulation (filter, mutate, summarize, group_by)
+library(corrplot) #Used for generating specifically correlaton matrices
+library(rpart) #The engine used to build the underlying math for decision tree models
+library(rpart.plot) #Used to draw a clean visual of the decision tree model
+library(vip) #Used to generate the variable importance plot
+
+```
+
+```{R}
+
+
+nfl2025playdata <- read.csv("/Users/aryamoghadam/PSTAT 131 - Machine Learning/Final Project Data/play_by_play_2025 .csv")
+#summary(nfl2025plays)
+
+#Link: https://nflfastr.com/index.html
+```
+
+![](images/Kyle%20Shanahan%20Calling%20Plays.webp){width="542"}
+
+## Aggressive or Conservative Play Calling?
+
+To win a football game in the National Football League, do you go for an
+all out aggressive long ball for the win or play it safe and cycle a few
+conservative run/short pass plays? This is what this model is here to
+answer. In the high-stakes environment of the NFL, offensive
+coordinators face a constant, game-defining dilemma: play it safe or go
+for broke? This project seeks to mathematically answer a fundamental
+question in sports analytics: "**Is conservative play calling or
+aggressive play calling more successful in winning big games in the
+NFL?**"
+
+## What's the difference?
+
+At first glance, the two philosophies offer vastly different paths to
+victory. A ***conservative play*** **calling** approach relies on
+predictable, low-risk maneuvers. These involve short passes and steady
+run plays designed to gain incremental yardage and safely navigate the
+opposing defense. However, this cautious strategy can quietly backfire.
+Relying too heavily on small gains can quickly lead to a daunting
+long-yardage situation on third or fourth down. Before the offense
+realizes it, a drive that felt "safe" stalls out, forcing a punt and
+surrendering valuable possession.
+
+But on the other end of the spectrum is the ***aggressive play***
+caller. This strategy embraces extreme risk for extreme reward,
+characterized by deep downfield passing or boldly attempting to convert
+on fourth down rather than punting. Successfully converting an
+aggressive fourth-down play keeps the offensive momentum rolling and
+applies immense pressure to the defense. Yet, the penalty for failure is
+severe.l A failed-fourth down attempt results in a catastrophic turnover
+on downs, immediately handing the ball and the momentum back to the
+opposing team at the exact spot of the failure.
+
+# Project Roadmap
+
+Now that we know the background and importance of our model, let's
+discuss how we are going to build our win predicting model. To determine
+which coaching philosophy actually translates to winning football, this
+project utilizes comprehensive NFL play-by-play data to build both
+predictive and inferential machine learning models. By tracking specific
+play types, situational game data (like time and score), and the
+ultimate game outcome (Win/Loss), we will use a classification approach
+to uncover whether fortune truly favors the bold, or if playing it safe
+is the ultimate blueprint for victory. Our goal is to use contextual
+predictor variables (such as play style, time remaining, and field
+position) to predict a binary class: "won_game," which will be our
+response variable detailing whether a team ultimately wins or loses the
+match.
+
+We will then perform an 80/20 training/test split on our data, make a
+recipe that includes dummy variables, and set folds for the 5-fold
+cross-validation we will implement. Basic logistic regression, elastic
+net, k-nearest neighbors, decision tree, and random forest models will
+all be used to model the training data when we finish the setup.
+Whichever model performs the strongest, we will then fit it to our
+testing data set, analyze how effective our model can truly be, and
+deploy it in a real-world scenario simulator. Without further ado, let's
+get play calling!!
+
+![](images/Sean%20McVay%20play%20calling.webp){width="542"}
+
+```{R}
+library(plyr)
+library(dplyr)
+
+
+#Cleaning the data first, by filtering for only run and pass plays
+clean_pbp <- nfl2025playdata %>%
+  filter(play_type %in% c("run", "pass")) %>%
+  #Removing QB kneels and spikes which skew conservative metrics
+  filter(qb_kneel == 0, qb_spike == 0) %>%
+  mutate(
+    play_id = as.numeric(play_id),
+    down = as.numeric(down),
+    ydstogo = as.numeric(ydstogo),
+    yardline_100 = as.numeric(yardline_100),
+    score_differential = as.numeric(score_differential),
+    qtr = as.numeric(qtr),
+    posteam_score = as.numeric(posteam_score),
+    defteam_score = as.numeric(defteam_score)
+  )
+  
+
+
+```
+
+The first step in preparing the raw NFL play-by-play dataset was
+isolating the plays that actively reflect offensive decision-making. We
+filtered the data to include strictly "run" and "pass" plays.
+Furthermore, quarterback kneels and clock-stopping spikes have also been
+removed, as these are mandatory clock-management maneuvers that would
+artificially skew the metrics for "conservative" play calling. Finally,
+a mutation pipeline was applied to convert core contextual variables
+(such as `down` `ydstogo`, `field position`, and `score differential`)
+into strict numeric data types.
+
+```{R}
+
+#Subsetting the data to only include the requested columns
+nfl_subset <- clean_pbp %>%
+  select(
+    play_id, game_id, home_team, away_team, season_type, yardline_100, 
+    qtr, down, ydstogo, yrdln, time, desc, play_type, yards_gained, 
+    pass_length, run_location, total_home_score, total_away_score, 
+    posteam_score, defteam_score, fourth_down_converted, fourth_down_failed, third_down_converted, 
+    third_down_failed, interception, incomplete_pass, fumble_lost, 
+    tackled_for_loss, sack, pass_touchdown, rush_touchdown, 
+    series_result, play_type_nfl, score_differential, quarter_seconds_remaining, half_seconds_remaining, game_seconds_remaining, posteam, defteam, pass_location
+  )
+
+```
+
+The original dataset consisted of hundreds of extra columns. Many of
+these were irrelevant to our analysis so we selected only the specific
+columns that we needed for our models.
+
+```{R}
+#lists the names of the columns that we plan to use from our nfl subset
+colnames(nfl_subset)
+
+```
+
+# Morphing the Data
+
+```{r}
+late_game_plays <- nfl_subset %>%
+  
+  mutate(
+    score_differential = total_home_score - total_away_score,
+    
+    game_seconds_remaining =
+      suppressWarnings(
+        as.numeric(
+          as.difftime(as.character(time),
+          format="%M:%S",
+          units="secs")
+        )
+      )
+  ) %>%
+  
+  filter(
+    qtr >= 4,
+    game_seconds_remaining <= 300,
+    score_differential >= -8 &
+    score_differential <= 8,
+    
+    !play_type %in% c(
+      "no_play",
+      "qb_kneel",
+      "qb_spike",
+      "punt",
+      "field_goal"
+    )
+  ) %>%
+  
+  mutate(
+    
+    catastrophic_failure = case_when(
+      play_type == "pass" & str_detect(desc,"INTERCEPTED") ~ 1,
+      play_type == "pass" & str_detect(desc,"SACK") ~ 1,
+      play_type == "run" & str_detect(desc,"FUMBLE") ~ 1,
+      down == 4 & yards_gained < ydstogo ~ 1,
+      TRUE ~ 0
+    ),
+    
+    massive_success = case_when(
+      yards_gained >= 20 ~ 1,
+      str_detect(desc,"TOUCHDOWN") ~ 1,
+      down == 4 & yards_gained >= ydstogo ~ 1,
+      yards_gained >= ydstogo ~ 1,
+      TRUE ~ 0
+    ),
+    
+    play_style = case_when(
+      play_type == "pass" & pass_length == "deep" ~ "Aggressive",
+      play_type == "pass" & pass_length == "short" ~ "Conservative",
+      play_type == "run" ~ "Conservative",
+      TRUE ~ "Other"
+    ),
+    
+    winning_team = case_when(
+      total_home_score > total_away_score ~ home_team,
+      total_away_score > total_home_score ~ away_team,
+      TRUE ~ "Tie"
+    ),
+    
+    won_game = case_when(
+      posteam == winning_team ~ "Won Game",
+      TRUE ~ "Lost Game"
+    ),
+    
+    play_outcome = case_when(
+      massive_success == 1 ~ "Massive Success",
+      catastrophic_failure == 1 ~ "Catastrophic Failure",
+      TRUE ~ "Standard Play"
+    )
+    
+  ) %>%
+  
+  select(
+    play_id, game_id, posteam, defteam,
+    down, ydstogo, yardline_100,
+    play_type, pass_length, pass_location,
+    run_location,
+    catastrophic_failure, massive_success,
+    play_style,
+    score_differential,
+    game_seconds_remaining,
+    won_game, winning_team,
+    play_outcome, qtr,
+    home_team, away_team,
+    posteam_score, defteam_score
+  ) %>%
+  
+  drop_na(won_game, catastrophic_failure)
+```
+
+## "Late_Game_Plays" dataset
+
+This entire code chunk, `late_game_plays`, is the beating heart or the
+absolute engine of our entire data preparation pipeline. It serves three
+critical purposes:
+
+1.  **The situational filter:** It strips away all the "noise" of a
+    standard football game. By filtering out early quarters, blowouts,
+    and clock-killing-kneel-downs, it isolates the exact high-stakes
+    do-or-die "crunch time" scenarios our research question is built
+    around.
+
+2.  **The Feature Factory:** The raw NFL data doesn't tell us if a play
+    was "Aggressive" or if an interception was a "Catastrophic Failure."
+    This dataset applies our custom logic to engineer those specific
+    predictor and outcome variables from scratch.
+
+3.  **The Machine Learning Foundation**: This is the finalized, pristine
+    dataframe that actually gets split into our training and testing
+    sets. Every single EDA plot and every predictive model relies
+    exclusively on this specific dataset to function.
+
+### How I Put It Together:
+
+-   The first step involved creating two foundational variables.
+    `score differential` was calculated to determine the exact point gap
+    at the time of the snap. Simultaneously, the raw clock format
+    (MM:SS) was converted into `game_seconds_remaining` (a pure numeric
+    value) so the machine learning algorithms could process time
+    mathematically.
+
+-   My intention for our models is to train them on true high-pressure
+    situations in a game. So I filtered the data so that it focuses on
+    plays that occurred in the 4th quarter or overtime (`qtr`***\>=
+    4**),* with exactly 5 minutes or less remaining
+    (`game_seconds_remaining` ***\<= 300**)* and where the score
+    differential was within one possession (between -8 and 8 points).
+
+-   Our predictor (`play_style`*)* predicts how plays are categorized
+    based on their inherent risk (conservative or aggressive).
+
+-   We created binary flags for `catastrophic_failure` (interceptions,
+    fumbles, sacks, and turnover on downs) and ***massive_success*** (20
+    yard gains, touchdowns, and critical first down conversions). These
+    flags were then grouped into a single ***play_outcome*** variable
+    for Exploratory Data Analysis.
+
+-   Our target variable (***won_game***) essentially calculates the
+    final outcome of the game and assigned a "Won Game" or "Lost Game"
+    label to the team that possessed the ball during that specific play.
+
+I also trimmed our data down to 25 key variables within
+`late_game_plays`:
+
+### Identifiers & Team Information
+
+-   `play_id`*:* A unique numerical identifier for the specific play
+
+-   `game_id`*:* A unique identifier for the entire game
+
+-   `posteam`: The team currently possession the football (the offense)
+
+-   `defteam`: The team currently playing defense
+
+-   `home_team`: The designed home team fro the matchup
+
+-   `away_team`*:* The designated away team for the matchup
+
+### Game Context (The situation)
+
+-   `qtr`: The current quarter of the game (filtered to 4th quarter or
+    overtime
+
+-   `game_seconds_remaining`: The exact number of seconds left on the
+    game clock
+
+-   `score differential`**:** The point difference between the home and
+    away team at the time of the snap
+
+-   `posteam_score`***:*** The current score of the team with the ball
+
+-   `defteam_score`***:*** The current score of the defending team
+
+-   `down`***:*** The current down of the play (Ex: 1st, 2nd, 3rd, or
+    do-or-die 4th)
+
+-   `ydstogo`: The number of yards required to secure a new first down
+
+-   `yardline_100`***:*** The literal distance to the goal line (100 =
+    backed up in own endzone, 0 = opponent's endzone).
+
+### Play Execution (The action)
+
+-   `play_type`***:*** The raw categorization of the play (filtered to
+    strictly "run" or "pass)
+
+-   `pass_length`***:*** The intended depth of a pass (Ex: "short" or
+    "deep")
+
+-   `pass_location`***:*** The directional target of a pass (left,
+    middle, or right)
+
+-   `run_location`***:*** The directional target of a rushing play
+    (left, middle, or right)
+
+### Engineered Variables (our custom metrics)
+
+-   `play_style`***:*** Our primary predictor, categorizing the
+    offensive decision as "Aggressive" (deep passes) or "Conservative"
+    (runs and short passes)
+
+-   `catastrophic_failure`***:*** A binary flag (1 or 0) triggered by
+    game-ruining mistakes like sacks, fumbles, interceptions, or a
+    turnover on downs.
+
+-   `massive_success`***:*** A binary flag (1 or 0) triggered by
+    game-winning execution like 20 yard gains, touchdowns, or critical
+    touchdowns.
+
+-   `play_outcome`: A categorical label combining the success/failure
+    flags into "Massive Success," "Catastrophic Failure," or "Standard
+    Play" for our EDA visuals.
+
+-   `winning_team`***:*** The team that ultimately secured the victory
+    at the end of the 4th quarter
+
+-   `won_game`: TARGET VARIABLE! Indicating whether the team possessing
+    the ball during this specific play went on to win the game ("Won
+    Game" or "Lost Game")
+
+```{R}
+#Figure out who won every game
+game_winners_table <- nfl_subset %>%
+  # Group the data game-by-game
+  group_by(game_id) %>%
+  # Sort by play_id so the final play of the game is at the very bottom
+  arrange(play_id) %>%
+  # Grab only the very last row (the final play of the game)
+  slice_tail(n = 1) %>%
+  # Figure out who had more points when the clock hit 0:00!
+  mutate(
+    winning_team = case_when(
+      posteam_score > defteam_score ~ posteam,
+      defteam_score > posteam_score ~ defteam,
+      TRUE ~ "Tie"
+    )
+  ) %>%
+  # Keep only the Game ID and the Winning Team
+  select(game_id, winning_team) %>%
+  ungroup()
+
+```
+
+To train our classification models, we needed a definitive "Win" or
+"Loss" outcome for every single play. However, the raw dataset only logs
+the score at the exact moment of the play, not the final result of the
+game. To solve this, we ultimately created a specialized
+(`game_winners_table`). We grouped the data by individual (`game_id`)
+and isolated the very last play of each game as the clock hit zero.
+
+```{R}
+
+#View the final results in the console
+
+table(late_game_plays$play_style, late_game_plays$catastrophic_failure)
+
+```
+
+Let's analyze this table these results. Remember, this exclusively
+focuses on the plays in the final five minutes of games.
+
+**The columns (0 and 1)**: These represent our `catastrophic_failure`
+variable. The 0 column is the number of "Safe" plays (no turnover/sack).
+The 1 column is the number of catastrophic failures (a turnover/sack).
+
+**The rows:** These represent our `play_style`.
+
+**The Math:** Teams called 1,751 total Conservative plays in the final 5
+minutes of a game (1695 safe + 56 failures). That means only 3.2% of
+conservative plays ended in a disaster. Teams called total Aggressive
+plays in the final 5 minutes of a game (282 safe + 32 failures). That
+means 10.2% of aggressive plays ended in a disaster.
+
+# Exploratory Data Analysis Visuals!!!
+
+## EDA 1: The Risk/Reward of Play Calling
+
+```{R}
+
+# EDA 1: The Risk/Reward Plot
+
+#This line throws out any play labeled as "Other"
+late_game_plays %>%
+  filter(play_style != "Other") %>%
+
+
+ggplot(aes(x = play_style, fill = play_outcome)) +
+  # position = "fill" makes all bars exactly the same height (100%)
+  # This allows us to easily compare percentages side-by-side!
+  geom_bar(position = "fill", color = "black", width = 0.6) +
+  
+  # Format the Y-axis as percentages
+  scale_y_continuous(labels = scales::percent_format()) +
+  
+  # Assign custom colors: Green for success, Red for failure, Gray for standard
+  scale_fill_manual(values = c("Massive Success" = "#2ca25f", 
+                               "Standard Play" = "#cccccc", 
+                               "Catastrophic Failure" = "#f03b20")) +
+  labs(
+    title = "EDA 1: The Risk vs. Reward of Play Calling",
+    subtitle = "Comparing Success and Failure Rates by Play Style",
+    x = "Play Style",
+    y = "Percentage of Plays",
+    fill = "Play Outcome"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    # Make the X-axis labels a bit bigger and bolder
+    axis.text.x = element_text(face = "bold", size = 12) 
+  )
+#this first plot adds standard plays
+
+
+
+
+#What if we wanted to filter out the standard plays?
+
+#Filter out the standard plays:
+extreme_outcomes_data <- late_game_plays %>%
+  filter(play_outcome %in% c("Massive Success", "Catastrophic Failure"),
+         play_style != "Other")
+
+
+#Build the Extreme Risk/Reward Matrix
+ggplot(extreme_outcomes_data, aes(x = play_style, fill = play_outcome)) +
+  # 100% stacked bar chart
+  geom_bar(position = "fill", color = "black", width = 0.6) +
+  
+  # Format Y-axis as percentages
+  scale_y_continuous(labels = scales::percent_format()) +
+  
+  # Keep our exact same Red and Green colors!
+  scale_fill_manual(values = c("Massive Success" = "#2ca25f", 
+                               "Catastrophic Failure" = "#f03b20")) +
+  labs(
+    title = "EDA 1b: The Extremes of Play Calling",
+    subtitle = "Success vs. Failure Rates (Excluding Standard Plays)",
+    x = "Play Style",
+    y = "Percentage of Extreme Outcomes",
+    fill = "Play Outcome"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold", size = 12) 
+  )
+
+```
+
+Here we have two plots (one of them including standard plays to sort of
+visualize how often they occur compared to aggressive/conservative
+plays, and another just includes exclusively aggressive/conservative
+plays). Looking at these plots, these visuals perfectly capture the
+dilemma facing NFL play-callers in the late stages of a game. As shown
+on the left, an aggressive play-style successfully generates a higher
+rate of 'Massive Successes'. However, it simultaneously exposes the team
+to a significantly higher rate of 'Catastrophic Failures'. Conversely,
+conservative play-calling minimizes the chance of a game-ending
+turnover, keeping the play within the 'Standard/Safe' parameters.
+Ultimately, this proves that aggressive passing is a high-variance
+strategy, while running and short passing are low-variance strategies.
+Aggressive plays, while risky, offer a much more balanced ratio of
+extreme rewards to extreme punishments.
+
+## EDA 2: Does pulling off an aggressive play actually win games?
+
+```{R}
+# EDA 2: Win Percentage by Play Style and Play Outcome
+ggplot(late_game_plays, aes(x = play_style, fill = won_game)) +
+  # 100% stacked bars to show win probability
+  geom_bar(position = "fill", color = "black", width = 0.6) +
+  
+  # facet_wrap splits the plot into 3 panels based on what happened on the play!
+  facet_wrap(~ play_outcome) +
+  
+  scale_y_continuous(labels = scales::percent_format()) +
+  
+  # Keeping our intuitive Green = Win, Red = Loss colors
+  scale_fill_manual(values = c("Won Game" = "#2ca25f", "Lost Game" = "#f03b20")) +
+  
+  labs(
+    title = "EDA 2: Does 'Pulling It Off' Actually Win Games?",
+    subtitle = "Comparing Game Win % between Aggressive and Conservative calls",
+    x = "Play Style Called",
+    y = "Game Win Percentage",
+    fill = "Final Game Result"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    # Make the panel headers bold
+    strip.text = element_text(face = "bold", size = 10),
+    # Angle the X-axis text slightly so Aggressive and Conservative don't overlap
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold") 
+  )
+```
+
+Looking at the "catastrophic failure" panel, the takeaway is that no
+matter if a coach is being aggressive or conservative, a catastrophic
+failure (a turnover, a sack, or a failed fourth down) in the late game
+is absolutely devastating to their chances of winning. The penalty for
+failure is a near-guaranteed loss.
+
+Where things get interesting is under the "massive success" panel (where
+big yardage plays are converted or first downs are converted
+successfully), pulling off a massive success drastically increases the
+win probability. But if we look closely at the two bars: if the
+conservative massive success (like a huge run or a gritty 4th down
+conversion) leads to a similar or higher win percentage than an
+aggressive massive success (like a deep pass), it proves a massive
+point. It means that grinding out yards on the ground while keeping the
+clock moving is just as, if not more, valuable than a flashy deep bomb.
+
+Looking at the standard play panel, which includes plays that don't
+include huge gains and no turnovers, the takeaway from this graph is
+that if the conservative bar has more green here, it means that playing
+it safe, protecting the football, and grinding out standard yardage is
+generally a more successful baseline strategy for securing a win than
+throwing standard passes.
+
+So the takeaway from this plot sort of answers the question: "Is
+conservative play calling or aggressive play calling more successful in
+winning big games?" While aggressive plays might generate a higher raw
+volume of massive successes, the risk is rarely worth the reward. The
+data proves that catastrophic failures almost guarantee a loss.
+Therefore, the statistically superior strategy in late-game situations
+is to play conservatively, protect the football, and minimize the risk
+of a game-ending mistake."
+
+## EDA 3: The Blueprint for Winning (Correlation Matrix)
+
+```{R}
+
+#Prepare the data
+# 1. Prepare the data (The Ironclad Version)
+corr_data <- late_game_plays %>%
+  ungroup() %>% # Removes any hidden groupings that might confuse R
+  mutate(
+    Win_Game = ifelse(won_game == "Won Game", 1, 0),
+    Score_Diff = as.numeric(score_differential),
+    Seconds_Left = as.numeric(game_seconds_remaining),
+    Yards_to_Go = as.numeric(ydstogo),
+    # Safely extract the 1s and 0s regardless of if they are factors or text
+    Failure = as.numeric(as.character(catastrophic_failure)),
+    Success = as.numeric(as.character(massive_success))
+  ) %>%
+  select(Win_Game, Score_Diff, Seconds_Left, Yards_to_Go, Failure, Success) %>%
+  drop_na() %>%
+  # THE ULTIMATE HAMMER: This absolutely forces every remaining column to be a pure number
+  mutate(across(everything(), as.numeric)) %>%
+  # Strip away any 'tibble' formatting just in case cor() is being overly sensitive
+  as.data.frame()
+
+# 2. Calculate the mathematical correlations
+cor_matrix <- cor(corr_data, use = "complete.obs")
+
+
+# 3. Reshape the matrix so ggplot can draw it as a grid
+cor_data_long <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Var1") %>%
+  pivot_longer(cols = -Var1, names_to = "Var2", values_to = "Correlation")
+
+
+#Build the Dot Matrix Plot (Clean Version)
+ggplot(cor_data_long, aes(x = Var1, y = Var2)) +
+  # geom_point creates the dots! 
+  geom_point(aes(size = abs(Correlation), color = Correlation)) +
+  
+  # (The geom_text layer has been completely removed from here!)
+  
+  # Color scale: Red for negative, Blue for positive
+  scale_color_gradient2(low = "#f03b20", mid = "gray90", high = "#2c7fb8", 
+                       midpoint = 0, limit = c(-1, 1), name = "Correlation") +
+  
+  # Manually control the minimum and maximum size of the dots
+  scale_size_continuous(range = c(4, 16), guide = "none") +
+  
+  labs(
+    title = "EDA 3: The Blueprint for Winning",
+    subtitle = "Correlation Dot Matrix of Late-Game Factors and Win Probability",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "grey80", linetype = "dashed") 
+  )
+
+```
+
+Here is a correlation heatmap describing which variables/predictors are
+the most effective when it comes to winning games. This chart will be a
+grid of squares ranging from -1 to 1.
+
+Looking specifically at the row labeled `Win_Game`, the `Score_Diff`
+square will have a shade of blue (meaning a positive correlation). It
+simply means that having a lead (a positive score differential) when you
+snap the ball highly correlates with winning the game. Where `Win_Game`
+and the `Failure` square intersect, this will most certainly include a
+shade of red (a negative correlation). Mathematically, as those failures
+go up, the chances of winning will plummet. Having `success` and winning
+the game is most certainly a positive correlation because converting on
+those first downs and scoring on touchdowns definitely gives the team a
+chance at winning the game.
+
+`Seconds_Left` and `Win_Game` have a pretty high positive correlation
+because having 50 seconds left on the clock does not necessarily mean
+that the team wins or loses. But it entirely depends on the score
+differential, which is the ultimate dictator of the game's outcome.
+
+Seeing `yards_to_go` and `Success` having a negative correlation makes
+sense. Because a negative correlation means that as one number goes up,
+the other number goes down. If `yards_to_go` is very low (for instance a
+3rd & 1 situation), it only takes a 1-yard plunge to trigger a "Success"
+in our dataset. NFL teams almost always convert these short-yardage
+situations at a very high rate. But when `yards_to_go` is very high, the
+offense has to magically pull off a 15 yard play in order to keep the
+drive alive. The success rate for this is naturally incredibly low.
+
+## EDA 4: The Down Dilemma
+
+#### Does the current down significantly change the probability of a catastrophic failure?
+
+```{R}
+library(dplyr)
+
+# EDA 4: Down vs Failure Rate
+eda_down_data <- late_game_plays %>%
+  # BULLETPROOF FIX 1: Explicitly keep ONLY valid football downs
+  # This automatically throws away NAs, "NA"s, or any other garbage data
+  dplyr::filter(down %in% c(1, 2, 3, 4, "1", "2", "3", "4")) %>%
+  
+  dplyr::group_by(down) %>%
+  
+  # BULLETPROOF FIX 2: Catch the failure whether it's stored as text OR a number!
+  dplyr::summarize(
+    total_plays = dplyr::n(),
+    #Using %in% catches the label whether it's a factor "1", numeric 1, or text!
+    failure_count = sum(catastrophic_failure %in% c(1, "1", "Failure", "Yes"), na.rm = TRUE),
+    failure_rate = failure_count / total_plays,
+    .groups = "drop"
+  )
+
+# The Plot
+ggplot(eda_down_data, aes(x = factor(down), y = failure_rate)) +
+  geom_bar(stat = "identity", fill = "#2c7fb8", width = 0.6) +
+  
+  # Add the percentage text on top of the bars!
+  geom_text(aes(label = scales::percent(failure_rate, accuracy = 0.1)),
+            vjust = -0.5, fontface = "bold", size = 5) +
+  
+  # Expand the top of the Y-axis slightly so the text doesn't get cut off
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.15))) + 
+  labs(
+    title = "EDA 4: The Pressure of the Downs",
+    subtitle = "Does the current down significantly 
+    change the probability of a catastrophic failure?",
+    x = "Down",
+    y = "Catastrophic Failure Rate"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank() 
+  )
+
+```
+
+What we can see from this graph is how identical the first, second, and
+third down catastrophic failure percentage rates are (which includes
+fumbles, interceptions, or sacks). They are actually quite rare since
+the team on offense still has the safety net of "the next down". That
+means they don't have to go for desperation plays. But it peaks when it
+reaches 4th down because almost all the time a team will turn it over on
+downs.
+
+But let's say we exclude the idea of a team failing on fourth down and
+only include the idea of turnovers, sacks, and interceptions. How would
+our plot look like there?
+
+```{R}
+
+# EDA 4b: Pure Turnovers & Sacks by Down
+eda_down_data_pure <- nfl_subset %>%
+  # 1. Recreate your exact late-game filters so the data matches perfectly
+  dplyr::mutate(
+    score_differential = as.numeric(total_home_score) - as.numeric(total_away_score),
+    game_seconds_remaining = suppressWarnings(as.numeric(as.difftime(as.character(time), format="%M:%S", units="secs")))
+  ) %>%
+  dplyr::filter(
+    qtr >= 4,
+    game_seconds_remaining <= 300,
+    score_differential >= -8 & score_differential <= 8,
+    !play_type %in% c("no_play", "qb_kneel", "qb_spike", "punt", "field_goal"),
+    down %in% c(1, 2, 3, 4, "1", "2", "3", "4")
+  ) %>%
+  
+  # 2. THE NEW RULE: Only Sacks, INTs, and Fumbles!
+  dplyr::mutate(
+    pure_failure = dplyr::case_when(
+      play_type == "pass" & stringr::str_detect(desc, "INTERCEPTED") ~ 1,
+      play_type == "pass" & stringr::str_detect(desc, "SACK") ~ 1,
+      play_type == "run" & stringr::str_detect(desc, "FUMBLE") ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  
+  # 3. Group and summarize with bulletproof dplyr formatting
+  dplyr::group_by(down) %>%
+  dplyr::summarize(
+    total_plays = dplyr::n(),
+    failure_count = sum(pure_failure == 1, na.rm = TRUE),
+    failure_rate = failure_count / total_plays,
+    .groups = "drop"
+  )
+
+# The Plot
+ggplot(eda_down_data_pure, aes(x = factor(down), y = failure_rate)) +
+  geom_bar(stat = "identity", fill = "#f03b20", width = 0.6) + # Red for Danger!
+  geom_text(aes(label = scales::percent(failure_rate, accuracy = 0.1)),
+            vjust = -0.5, fontface = "bold", size = 5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.20))) + 
+  labs(
+    title = "EDA 4b: The Pure Error Rate by Down",
+    subtitle = "Excluding 'Turnover on Downs' to isolate Sacks, INTs, and Fumbles",
+    x = "Down",
+    y = "Pure Failure Rate (Sacks/INTs/Fumbles)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank() 
+  )
+
+
+
+
+
+
+```
+
+What we can take away from this plot is it's failure rate is greatly
+affected when looking at fourth down, because there is still a greater
+chance that a team who goes for it on fourth down throws an interception
+or gets sacked. And this is because of the magnitude of pressure it
+takes to convert on a fourth down, knowing how it's now or never.
+
+## EDA 5: Field Position Geography
+
+#### Are teams more likely to make a catastrophic mistake when backed up against their own endzone, or when knocking on the door of the opponent's endzone?
+
+```{R}
+
+#1. Filter out the standard plays
+density_extremes_data <- late_game_plays %>%
+  filter(play_outcome %in% c("Massive Success", "Catastrophic Failure"))
+
+# 2. Build the focused Density Plot
+ggplot(density_extremes_data, aes(x = yardline_100, fill = play_outcome, color = play_outcome)) +
+  # geom_density creates the smooth mountain shapes
+  geom_density(alpha = 0.5, linewidth = 1) +
+  
+  # Reverse the X axis so 100 (Own Endzone) is on the left, and 0 (Scoring) is on the right
+  scale_x_reverse(breaks = seq(100, 0, by = -10)) +
+  
+  # Keeping our Green and Red colors!
+  scale_fill_manual(values = c("Massive Success" = "#2ca25f", 
+                               "Catastrophic Failure" = "#f03b20")) +
+  scale_color_manual(values = c("Massive Success" = "#2ca25f", 
+                                "Catastrophic Failure" = "#f03b20")) +
+  labs(
+    title = "EDA 5: Where Do Extreme Plays Happen?",
+    subtitle = "Field Position Density: Massive Successes vs. Catastrophic Failures",
+    x = "Yards to Goal (100 = Own Endzone, 0 = Opponent Endzone)",
+    y = "Density (Concentration of Plays)",
+    fill = "Play Outcome",
+    color = "Play Outcome"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold", margin = margin(t = 10)) 
+  )
+
+```
+
+This cool looking plot quite literally resembles a football field! From
+100 to 0 (the team on offense tries to move down the field and gain
+yards towards the direction of the opponent endzone).
+
+The density plot maps the geographical distribution of extreme outcomes,
+revealing a fascinating divergence between success and failure. "Massive
+Success" (the green curve) heavily concentrate between the 50 and 70
+yard lines, which logically tracks. As generating a 20+ yard play
+requires sufficient open field. However, "Catastrophic Failures" (the
+red curve) peak significantly further down the field, cresting around
+the 30-40 yard line. This area represents a zone where teams are often
+too close to punt (punting is used to surrender possession to the other
+team if the team is too far away from scoring a field goal or a
+touchdown. Usually on 4th down this is pulled off. A punter usually
+kicks the ball as far as he can down the field to maximize field
+position.) Consequently, in late game situations, offenses are forced to
+attempt risky 4th down conversions or throw deep into condensed
+coverage, causing the failure rate to spike as a result.
+
+This proves that field position itself acts as a multiplier for risk.
+Therefore, calling aggressive, high-variance plays when backed up
+against one's own endzone is statistically the most dangerous decision
+an offensive coordinator can make.
+
+## EDA 6: Yards to Go Boxplot
+
+## How does the required 'yards to go' differ between aggressive and conservative play calls
+
+```{R}
+
+# EDA 6: Yards to Go Boxplot
+late_game_plays %>%
+  filter(play_style != "Other") %>%
+
+  ggplot(aes(x = play_style, y = ydstogo, fill = play_style)) +
+  # geom_boxplot builds the boxes, alpha makes them slightly transparent
+  geom_boxplot(alpha = 0.7, color = "black", outlier.color = "red", outlier.alpha = 0.5) +
+  
+  # Keeping our Aggressive (Red) and Conservative (Blue) colors
+  scale_fill_manual(values = c("Aggressive" = "#f03b20", "Conservative" = "#2c7fb8")) +
+  
+  # Y-axis breaks every 5 yards to make it easy to read
+  scale_y_continuous(breaks = seq(0, 40, by = 5)) +
+  
+  labs(
+    title = "EDA 6: Does Distance Dictate Aggression?",
+    subtitle = "Yards to Go vs. Play Style Called in the Late Game",
+    x = "Play Style Called",
+    y = "Yards to Go (for 1st Down)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold", size = 12),
+    legend.position = "none"
+  )
+
+```
+
+Looking at this boxplot, we can see that the thick black median line for
+both the red and blue boxes is sitting exactly at the 10-yard mark and
+the top of both boxes stop right there too. Because the vast majority of
+plays in an NFL game happen with exactly 10 yards to go (1st & 10). And
+a result, it creates a massive gravitational pull in the data.
+
+Looking at the short yardage situations (which would be the bottom line
+of the boxes, representing the 25th percentile of the data). The bottom
+of the conservative box stretches way down to about 3 or 4 yards. Which
+means that the team is in a short yardage situation in order to get the
+first down (like 3rd & 3 or 2nd & 1). Coaches tend to overwhelmingly
+lean on conservative play calls (like runs or quick slants) to move the
+chains. However, the aggressive box stops much higher, around 7 yards.
+This shows that coaches very rarely dial up deep, aggressive shots when
+they only need a few yards to get the first down.
+
+But what are those dots located way above the boxes? Those that stretch
+out to 20, 30 and even 40 yards (basically like a 2nd & 20, or 3rd & 30
+situation). These are our outliers of the data, located within both play
+call categories. The red dots located in the aggressive category high
+represent the "Desperation Deep Ball," which is ultimately an aggressive
+play because they absolutely have to get 20 yards. The blue dots located
+in the conservative category represent a play being drawn from 3rd & 25
+or 2nd & 20. At that point coaches have completely given up on trying to
+get the first down and just running a conservative play to get better
+punting position to avoid a turnover.
+
+## EDA 7: The "Danger Zone" Faceted Scatterplot
+
+#### Does field position and yards-to-go actually dictate risk, or does the offensive coordinator's play style override everything else?
+
+```{R}
+
+# EDA 7: Faceted Scatterplot
+
+late_game_plays %>%
+  filter(play_style != "Other") %>%
+  
+ggplot(aes(x = yardline_100, y = ydstogo, color = factor(catastrophic_failure))) +
+  # geom_jitter slightly shakes the dots so we can see all of them!
+  geom_jitter(alpha = 0.6, width = 1, height = 0.5, size = 2) +
+  # facet_wrap splits the plot into two side-by-side charts based on play style
+  facet_wrap(~ play_style) +
+  scale_color_manual(values = c("0" = "#2c7fb8", "1" = "#f03b20"), 
+                     labels = c("Safe", "Failure")) +
+  labs(
+    title = "EDA 7: The 'Danger Zone' by Play Style",
+    subtitle = "Field Position vs. Yards to Go",
+    x = "Distance to Goal (Yardline_100)",
+    y = "Yards to Go",
+    color = "Outcome"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 14) # Makes the Aggressive/Conservative labels bold
+  )
+
+```
+
+The faceted scatter plot reveals the geographical 'Danger zone' of
+late-game play calling. While the sheer volume of plays falls under the
+Conservative category, the Aggressive panel displays a visibly higher
+density of Catastrophic failures (red dots). Specifically, when teams
+attempt Aggressive plays with 10 or more yards to go, the risk of a
+game-altering turnover or sack increases noticeably across almost all
+field positions. This visual evidence suggests that Aggressive
+play-calling introduces a high-variance risk that Conservative
+play-calling successfully avoids.
+
+## Setting Up Models
+
+### Setting up training/testing split
+
+Now that we're done looking at all those cool, colorful, and informative
+visualizations, let's now set up our models! But first, we need to
+train/test our data.
+
+Setting up the training/testing split with stratified sampling, followed
+up by the "universal recipe". We are looking at a classification
+problem, because we're predicting whether the play was successful or did
+it fail (like a yes/no question).
+
+For stratified sampling, we do specifically an 80/20 split, 80% of the
+training set and 20% of the testing set) and from that 80/20 split, the
+exact same percentage consist of "Yes" and "No" failures. Before passing
+the data into the machine learning algorithms, the target variable
+(`won_game` and `catastrophic_failure`) were converted to factors to
+enable classification mapping. To evaluate the models effectively, the
+perfectly cleaned dataset was partitioned using an 80/20 train-test
+split.
+
+```{R}
+
+library(dplyr)
+
+#We first convert catastrophic_failure to a proper factor
+late_game_plays <- late_game_plays %>%
+  dplyr::mutate(
+    #Use as.factor() to let R handle the existing text/numbers
+    catastrophic_failure = as.factor(catastrophic_failure),
+    won_game = as.factor(won_game),
+    score_differential = as.numeric(score_differential),
+    ydstogo = as.numeric(ydstogo),
+    yardline_100 = as.numeric(yardline_100),
+    down = as.numeric(down)
+    )
+
+#Splitting the data:
+set.seed(2025) 
+#Creating the 80/20 split, stratified by our target variable
+data_split <- initial_split(late_game_plays, prop = 0.80, strata = won_game)
+
+
+#Extract the training and testing datasets
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+#Clean the training data here
+train_data <- train_data %>%
+tidyr::drop_na(
+  won_game, catastrophic_failure, play_style, score_differential, game_seconds_remaining, ydstogo, yardline_100, down
+)
+
+train_data_clean <- train_data %>%
+  dplyr::mutate(dplyr::across(where(is.character), ~na_if(.x, ""))) %>%
+  # Convert Inf/NaN to NA so drop_na can see them
+  dplyr::mutate(dplyr::across(where(is.numeric), ~if_else(is.finite(.x), .x, NA_real_)))
+  
+
+
+
+
+# Convert problematic variables to numeric (not integer)
+#train_data <- train_data %>%
+ # mutate(
+  #  score_differential = as.numeric(score_differential),
+  #  ydstogo = as.numeric(ydstogo),
+  #  yardline_100 = as.numeric(yardline_100),
+  ## ) %>%
+
+#Drop rows with missing values ONLY in relevant variables
+ # tidyr::drop_na(
+    #won_game, catastrophic_failure, play_style, 
+ #   score_differential, game_seconds_remaining, 
+     # ydstogo, yardline_100, down
+ # )
+
+
+  
+  
+#Verifying no NaNs or Infs remain (using dplyr:: to prevent errors)
+#train_data_clean %>%
+  #dplyr::summarise(dplyr::across(everything(), ~ sum(is.nan(.x) | is.infinite(.x))))
+
+
+
+#I set the seed value to 2025, so that the folds are identical every time I run it
+set.seed(2025) 
+#this gives us the exact same random split every time that I run the split
+data_folds <- vfold_cv(train_data_clean, v = 5, strata = won_game) #used for resampling the training data to get better estimate of testing error, without having to touch the testing error
+
+
+
+#Verifying that the split worked:
+nrow(train_data_clean)
+nrow(test_data)
+
+
+
+#Create the confusion matrix at the very end and use only one of them for the best possible model
+#I need to fit it into the folds and looking at the cross validation error, using tune_grid(), fit_resamples() and collect_metrics()
+
+```
+
+Because NFL game outcomes can be imbalanced, stratified sampling
+(`strata = won_game)` was utilized during this split to guarantee that
+both the training and testing sets contained the exact same proportion
+of wins and losses.
+
+To safely tune the models without exposing them to the testing data, the
+training set was divided into 5 distinct folds using V-fold
+cross-validation. This re-sampling technique allows the models to
+iteratively train and validate themselves, providing a robust estimate
+of out-of-sample performance while preventing overfitting.
+
+Doing stratified sampling for cross-validation is useful because it
+ensures that the proportion of the outcome variable
+(`catastrophic_failure`) is kept consistent across our training set, our
+test set, and every single one of our cross-validation folds.
+
+## Recipe Building/Data Cleaning:
+
+```{R}
+library(dplyr)
+library(tidyr)
+
+# 1. Fully clean and prep the dataset BEFORE splitting!
+late_game_plays_clean <- late_game_plays %>%
+  # Fix the types
+  dplyr::mutate(
+    catastrophic_failure = as.factor(catastrophic_failure),
+    won_game = as.factor(won_game),
+    score_differential = as.numeric(score_differential),
+    ydstogo = as.numeric(ydstogo),
+    yardline_100 = as.numeric(yardline_100),
+    down = as.numeric(down)
+  ) %>%
+  # Replace blank strings with NA
+  dplyr::mutate(dplyr::across(where(is.character), ~na_if(.x, ""))) %>%
+  # Convert Inf/NaN to NA
+  dplyr::mutate(dplyr::across(where(is.numeric), ~if_else(is.finite(.x), .x, NA_real_))) %>%
+  # DROP THE NAs HERE
+  tidyr::drop_na(
+    won_game, catastrophic_failure, play_style, 
+    score_differential, game_seconds_remaining, 
+    ydstogo, yardline_100, down
+  )
+#We run drop_na() on the entire dataset before doing the splitting process
+#Because by doing this, we completely throw any invalid plays in the trash
+
+# 2. NOW split the perfectly clean data
+set.seed(2025) 
+data_split <- initial_split(late_game_plays_clean, prop = 0.80, strata = won_game)
+
+# 3. Extract train and test sets (they are now naturally clean!)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# 4. Create the folds for tuning
+set.seed(2025) 
+data_folds <- vfold_cv(train_data, v = 5, strata = won_game)
+
+
+#Verifying that the split worked:
+nrow(train_data)
+nrow(test_data)
+
+
+```
+
+We create the universal recipe here. For a mixed dataset like the one
+that we have (some categorical data like `play_style` and some numerical
+data like `ydstogo`), a universal recipe typically requires three
+specific steps:
+
+1.  **Dummy variables**: Machine learning models only understand
+    numbers. `step_dummy()` turns categories (like "Aggressive" /
+    "Conservative") into binary 1s and 0s behind the scenes.
+
+2.  **Normalization**: Columns like `yardline_100` go from 1 to 99,
+    while `ydstogo` might only go from 1 to 10. `step_normalize()` puts
+    all of the numbers on the same mathematical scale so the model
+    doesn't get confused by the big numbers.
+
+3.  **Zero Variance Filter**: `step_zv()` removes any columns that
+    contain only one value (which provide zero predictive power).
+
+```{r}
+
+#train_data$won_game <- as.character(train_data$won_game)
+#because classification models require our outcome to be a factor.
+
+
+library(themis) # Make sure this is loaded for SMOTE
+
+nfl_recipe <- recipe(
+  won_game ~ catastrophic_failure + play_style + score_differential + game_seconds_remaining + 
+             ydstogo + yardline_100 + down, # Added 'down' since it caused errors earlier
+  data = train_data_clean
+) %>%
+  
+  #Handle actual NAs in numeric predictors first
+  #step_naomit(all_predictors(), all_outcomes()) %>%
+  #the model crashes if we have this line
+  
+  
+    #Convert any lingering strings to factors first 
+  step_string2factor(all_nominal_predictors()) %>%
+  
+  
+  #Handle "New" or "Unknown" categories in categorical predictors
+  # This prevents the "New levels in game_id" style errors
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  
+  #Clean up rare categories (lumping them into "other")
+  step_other(play_style, threshold = 0.05) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  
+  #Remove columns with only one value (zero-variance)
+  step_zv(all_predictors()) %>%
+  
+  #Normalize numeric data (crucial for KNN and elastic net)
+  step_normalize(all_numeric_predictors()) %>%
+  
+  #Balance the dataset with SMOTE (must be the very last step)
+  step_smote(won_game)
+```
+
+```{R}
+#Keeping track of the missing data
+#Calculate the exact number of rows dropped
+original_row_count <- nrow(late_game_plays)
+clean_row_count <- nrow(late_game_plays_clean)
+rows_dropped <- original_row_count - clean_row_count
+
+#Print the official statement for the report
+cat("Out of", original_row_count, "total late-game plays,", 
+    rows_dropped, "rows were dropped due to missing or invalid data, leaving", 
+    clean_row_count, "perfectly clean plays for the model to train and test on.")
+
+```
+
+Within our data cleaning pipeline, we tackled the missing data in three
+steps:
+
+1.  We unmasked the hidden NA's. We used na_if `na_if(.x, "")` to find
+    blank text strings and force them to become official NA's.
+
+2.  Mathematical Scrubbing: We used if_else `if_else`
+    `(is.finite(.x), .x, NA_real)` to find impossible math outputs (like
+    NaN or Inf that sometimes happen when calculating clock times) and
+    forced them to become NA.
+
+3.  Targeted Deletion: We used `drop_na(...)` specifically on our core
+    predictors and outcomes (`won_game`, `play_style`, `ydstogo`, etc.).
+
+The raw NFL play-by-play dataset contained instances of missing data,
+blank character strings, and invalid numeric calculations (such as NaN
+or Inf values generated during time-remaining conversions). Handling
+missing data was a critical step prior to the initial data split to
+ensure the model was trained strictly on valid, factual game states.
+
+In football analytics, a play's context is an absolute factual event;
+mathematically estimating a missing "`yardline_100`" or "`ydstogo`"
+value would introduce fabricated scenarios into the model and corrupt
+the situational context.
+
+Missing data was handled using targeted Complete Case Analysis. First,
+all blank strings were coerced into NA values, and all infinite or
+non-numeric values were coerced into "`NA_real_`" . Finally,
+"`tidyr::drop_na()`" was applied exclusively to the core predictors and
+outcome variables required for the models (`won_game`,
+`catastrophic_failure`, `play_style`, `score_differential`,
+`game_seconds_remaining`, `ydstogo`, `yardline_100`, and `down`). Any
+play missing these critical contextual data points was entirely removed
+from the dataset prior to the 80/20 train-test split, ensuring that both
+the training recipe and final testing metrics were built on a perfectly
+clean foundation. Furthermore, the `step_unknown()` function was
+utilized in the recipe to gracefully handle any unforeseen missing
+categorical levels during cross validation.
+
+# Modeling Time!!
+
+## Non-tuned Logistic Regression:
+
+Let's start things off with a basic non-tuned logistic regression model.
+And then we look at an elastic net after this:
+
+```{R}
+library(tidymodels)
+
+basic_log_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+basic_log_workflow <- workflow() %>%
+  add_recipe(nfl_recipe) %>%
+  add_model(basic_log_spec)
+
+basic_log_resamples <- fit_resamples(
+  basic_log_workflow,
+  resamples = data_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(basic_log_resamples)
+```
+
+### Extracting the basic logistic regression model
+
+```{R}
+# Since there are no tuning parameters, we just use the original workflow directly!
+basic_log_final_fit <- last_fit(
+  basic_log_workflow, 
+  split = data_split
+)
+
+# View the final test metrics for the basic logistic regression
+collect_metrics(basic_log_final_fit)
+
+```
+
+A standard logistic regression model is linear. It essentially tries to
+draw a straight simple line through our data to separate the wins from
+the losses. And ultimately it looks at each variable in isolation.
+Football is highly situational however. A conservative play style on 1st
+down at a team's own 20 yard line means something completely different
+than a conservative play style on 4th down at the opponent's 5 yard
+line.
+
+What we can see from our results is it's accuracy is at 65.4%. And an
+ROC_AUC value of 0.714. That means our model can't handle the complex
+"If it's the 4th quarter AND are down by 4, then aggressive is better"
+logic.
+
+## Elastic Net:
+
+Creating a Logistic Regression (Elastic Net) Model. We need to use an
+engine called `glmnet`
+
+By using `glmnet`, we unlock two new dials that we can tune to prevent
+over-fitting:
+
+1.  `penalty`: How harshly the model should penalize variables that
+    aren't actually useful (This helps ignore the "noise" within the
+    data)
+
+2.  `mixture`: The balance between two different styles of penalties
+    (Lasso vs. Ridge)
+
+```{R}
+#Defining the model specification
+elastic_net_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  #we use "glmnet" so we can tune the penalty (regularization) to prevent overfitting
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+
+#Bundling it into a workflow
+elastic_net_workflow <- workflow() %>%
+  add_model(elastic_net_spec) %>%
+  add_recipe(nfl_recipe)
+
+    
+
+#Now we create a tuning grid
+#This essentially gives the model 50 different penalty values to try out
+#penalty_grid <- grid_regular(penalty(range = c(-5, 1)), levels = 50)
+ 
+    
+ 
+#Setting up a grid of penalty and mixture values to try
+# (glmnet requires these specific tuning parameters)
+    elastic_net_grid <- grid_regular(penalty(),
+                                     mixture(),
+                                     levels = 5)
+  
+
+#Tuning the model here (which is where the magic happens)
+set.seed(2025)
+elastic_net_tune_results <- tune_grid(
+  elastic_net_workflow,
+  resamples = data_folds,
+  grid = elastic_net_grid
+)
+
+#View the results
+collect_metrics(elastic_net_tune_results)
+
+```
+
+### Extracting the best penalty and mixture combination:
+
+```{R}
+
+#Extract the best penalty and mixture combination
+best_elastic_params <- select_best(elastic_net_tune_results, metric = "roc_auc")
+
+#Plug those best parameters back into the workflow
+elastic_final_workflow <- finalize_workflow(
+  elastic_net_workflow,
+  best_elastic_params
+)
+
+#Fit the finalized workflow to the testing data
+elastic_final_fit <- last_fit(
+  elastic_final_workflow,
+  split = data_split
+)
+
+#View the final test metrics for the Elastic Net
+collect_metrics(elastic_final_fit)
+
+
+```
+
+A mean score that lies between 0.60 and 0.70 is decent. But if it's 0.70
+and 0.80 that would mean it's strong and really good for real-world
+sports data. The 'n' column confirms that each of these means was
+calculated across all 5 of our cross-validation folds. The tuned elastic
+net model gave us an ROC AUC amount of approximately 0.667. But the
+basic logistic regression model gave us an ROC AUC amount of about
+0.6669. Tuning the penalties didn't really improve the model all that
+much. Since our data has hit the "linear ceiling".
+
+Remembering our main question that we are trying to find an answer for:
+"Is conservative or aggressive play calling more successful in winning
+big games?" Linear models (like logistic regression and elastic net) try
+to give a single, rigid, straight line answer to that question. It might
+try to decide that "aggressive is always better and more impactful" and
+apply that rule across the board. But in the NFL, the success of a
+conservative or aggressive play call is entirely dependent on the
+context, the quarter, the score differential, and the yard line.
+
+From what we found out, both our basic logistic regression and elastic
+net models were suffering from underfitting. They simply could not
+capture the complex, overlapping realities of NFL play calling.
+Regularizing the linear model via an Elastic net provided negligible
+improvements over the baseline Logistic regression. This indicates that
+the limitations of the linear models were not due to high variance or
+multicolinearity, but rather the inherently non-linear and conditional
+nature of late-game football strategy.
+
+```{R}
+library(ggplot2)
+
+# Generate the autoplot for the Logistic Regression tuning results
+#Essentially the elastic net model
+# Replace 'log_tune_results' with whatever you named your tuning object!
+autoplot(elastic_net_tune_results, metric = "roc_auc")
+
+```
+
+Looking at the elastic net tuning plot demonstrates that applying
+regularization failed to improve the model's performance. It tells a
+very specific, yet somewhat dramatic story about how linear models
+struggle to understand the complexities of an NFL football game. The
+Y-axis (roc_auc) shows the model's "grade." The highest points on this
+graph hover right around 0.66 to 0.67. The X-axis (amount of
+regularization) represents the penalty. On the far left, the model is
+basically unpunished (it acts like a standard logistic regression). As
+we move to the right, we are applying a more stricter and stricter
+mathematical penalty, forcing the model to shrink or drop variables.
+
+The red line (0.00) is pure Ridge regression (it shrinks variables but
+rarely drops them). The purple line (1.00) is pure Lasso regression (it
+acts like a bouncer, aggressively kicking variables entirely ouf of the
+model if they aren't useful).
+
+This further confirms that NFL play-calling success requires the
+non-linear, contextual mapping. And those would be provided by the tree
+models which we'll look below.
+
+## Tuned K-Nearest Neighbors model:
+
+Next we will experiment using a tuned K-nearest neighbors model. It's
+very intuitive for sports analytics. When it tries to predict if a play
+will fail, it looks at the dataset, finds the 5 plays that are the most
+mathematically similar to the current play (same yard line, same down,
+same distance, same play style), and basically takes a vote. If 4 out of
+the 5 similar plays were safe, then it deems a prediction that the new
+play will be safe too.
+
+One important rule with KNN models is the numeric data MUST be
+normalized. KNN works by calculating the literal, geometric distance
+between data points. If `game_seconds_remaining` is a massive number and
+`score_differential` is a tiny number (like 3), the math is going to
+completely ignore the score and only care about the clock. So we use
+`step_normalize()` in our recipe to shrink all numeric variables down to
+the exact same scale so that they have an equal voice.
+
+```{R}
+#Defining the KNN model specification
+#We tell the model to tune the 'neighbors' parameter
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+#Bundling it into a workflow
+knn_workflow <- workflow() %>%
+  add_recipe(nfl_recipe) %>%
+  add_model(knn_spec)
+
+#Creating the tuning grid
+#We test 25 different values for k, ranging from 1 to 50
+knn_grid <- grid_regular(neighbors(range = c(1, 50)), levels = 25)
+
+
+#Tuning the model across our folds, which could take a bit of time
+knn_tune_results <- tune_grid(
+  knn_workflow,
+  resamples = data_folds,
+  grid = knn_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+#Show the final scorecard
+#show_best(knn_tune_results, metric = "roc_auc")
+
+print(knn_tune_results)
+
+
+# This unpacks the box and shows us the average scores for all 50 values of K
+collect_metrics(knn_tune_results)
+
+# This will specifically print out a leaderboard of the top 5 best values of K
+show_best(knn_tune_results, metric = "roc_auc")
+
+```
+
+### Extracting the best number of Neighbors
+
+```{R}
+
+#Extract the best number of neighbors (K)
+best_knn_params <- select_best(knn_tune_results, metric = "roc_auc")
+
+#Plug that best K back into the workflow
+knn_final_workflow <- finalize_workflow(
+  knn_workflow,
+  best_knn_params
+)
+
+#Fit the finalized workflow to the testing data
+knn_final_fit <- last_fit(
+  knn_final_workflow,
+  split = data_split
+)
+
+# View the final test metrics for the KNN model!
+collect_metrics(knn_final_fit)
+
+```
+
+The tuned KNN model ultimately gave us an accuracy percentage of 70.1%,
+an roc_auc of 0.780, and a brier_class of 0.198. A KNN model is not
+linear, because instead of drawing a straight line, it looks at a play
+and asks, "What happened in the 15 most similar historical situations?"
+Because NFL play calling is highly situational, grouping similar plays
+together works much better than a rigid, linear rule. KNN essentially
+calculates "distance" between plays. But because we have a lot of
+categorical dummy variables (like play_style_Aggressive or
+play_style_Conservative), calculating mathematical "distance" ultimately
+can get a little fuzzy. Which is where we now move into the tree models
+to see how it will do there.
+
+## Decision Tree Model:
+
+Next model we are going to look at is a decision tree. A decision tree
+builds a flowchart that we can visualize and it can give exact rules,
+like: "If the play is aggressive, AND it's 4th down, AND there are more
+than 5 yards to go, THEN predict a Catastrophic Failure." Instead of
+doing complex geometry (like KNN) or drawing a single straight line
+(like Logistic Regression), a Decision tree basically asks a series of
+"If-Then" questions. For instance: "IF the play is Aggressive, and IF
+there are less than 60 seconds left... THEN preidct Failure."
+
+First we need to install the necessary packages to work with the tree
+packages.
+
+```{R}
+library(rpart)
+library(rpart.plot)
+
+```
+
+First let's look at a non-tuned decision tree model. When a non-tuned
+version of this model is ran, R's `rpart` engine uses its default rules.
+Basically it stops growing the tree if a bucket has fewer than 20 plays,
+and it applies a standard complexity penalty of 0.01
+
+```{R}
+#Define the basic decision tree:
+basic_tree_spec <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+#Bundle into workflow (which includes our nfl_recipe)
+basic_tree_workflow <- workflow() %>%
+  add_recipe(nfl_recipe) %>%
+  add_model(basic_tree_spec)
+
+#Fit to resamples (cross-validation is utilized for basic models)
+set.seed(2025) #Change to the same seed we used before for consistency
+basic_tree_resamples <- fit_resamples(
+  basic_tree_workflow,
+  resamples = data_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_resamples(save_pred = TRUE)
+)
+
+
+#Displaying the results
+#We use collect_metrics() instead of show_best() since there's no grid of winners
+collect_metrics(basic_tree_resamples)
+
+
+```
+
+### Extracting the basic decision tree
+
+```{R}
+# Pass the original workflow directly into last_fit
+basic_tree_final_fit <- last_fit(
+  basic_tree_workflow,
+  split = data_split
+)
+
+# View the final test metrics for the basic decision tree!
+collect_metrics(basic_tree_final_fit)
+
+```
+
+The non-tuned decision tree model ultimately gave us an accuracy
+percentage of 66.6%, an ROC AUC score of 0.743, and a brier_class of
+0.194. The decision tree beat both the logistic regression and elastic
+net models because it can make conditional rules (if 4th quarter AND
+down by 4, then Aggressive), unlike a single tree which is prone to
+being a little too simplistic.
+
+## Tuned Decision Tree:
+
+Now let's try and run a tuning decision tree model.
+
+`cost_complexity`: A math penalty that forces the tree to only add a new
+branch if it significantly improves accuracy.
+
+`tree_depth`: The absolute maximum number of levels the tree is allowed
+to grow.
+
+`min_n`: The minimum number of plays that must be in a group before the
+tree is allowed to split it again
+
+Over here is where we create our upgraded tuned decision tree model
+
+```{R}
+library(themis)
+library(tidymodels)
+
+
+#Defining the tuned decision tree model
+tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+# Bundle into the workflow
+tree_workflow <- workflow() %>%
+  add_recipe(nfl_recipe) %>% 
+  add_model(tree_spec)
+
+#Creating the tuning grid
+#We will test 25 different combinations of depth and complexity
+tree_grid <- grid_regular(
+  cost_complexity(),
+  tree_depth(),
+  levels = 10  #R tests 10 depths and 10 complexity penalties. 
+  #10 * 10 = 100 total tree combinations, 500 total fits across the folds
+)
+
+#If levels = 30, then R tests 30 depths and 30 complexity penalties
+# 30 * 30 = 900 total tree combinations. Across our 5 folds, R has to fit 4,500 models
+
+
+#Tuning the model across our folds
+set.seed(2025) #important for retaining the same value each time we run the model
+tree_tune_results <- tune_grid(
+  tree_workflow,
+  resamples = data_folds,
+  grid = tree_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+show_best(tree_tune_results, metric = "roc_auc")
+
+```
+
+### Extracting the tuned decision tree
+
+```{R}
+
+# Finalize the tuned tree!
+best_tree_params <- select_best(tree_tune_results, metric = "roc_auc")
+
+tree_final_workflow <- finalize_workflow(
+  tree_workflow,
+  best_tree_params
+)
+
+tree_final_fit <- last_fit(
+  tree_final_workflow,
+  split = data_split
+)
+
+collect_metrics(tree_final_fit)
+
+```
+
+Tuning definitely made such a difference in our decision tree. With our
+tuned decision tree, it scored an accuracy percentage of 72.8% and an
+ROC_AUC value of 0.795. By letting our model test 100 different
+combinations, it figured out exactly how deep to grow its branches to
+perfectly capture the context of the game without overfitting.
+
+Decision trees are just notorious for over-fitting because they tend to
+memorize the training data instead of learning the general rules. In a
+sport that's as chaotic as football, a model that draws a single, rigid
+mathematical line (logistic regression) often outperforms a model that
+tries to build highly specific buckets for every scenario, which is what
+the decision tree does.
+
+It did better than the non-tuned decision tree model because the
+non-tuned tree ultimately ended up with an ROC AUC mean of 0.795
+compared to what the tuned decision tree's ROC AUC value was (which was
+0.743).
+
+### Decision Tree Plot:
+
+```{r}
+library(rpart)
+library(rpart.plot)
+
+#Extracting the underlying math from our workflow
+tree_engine <- extract_fit_engine(tree_final_fit)
+
+#Pruning the tree:
+#We force it to be simpler just for the visualization
+#The higher the 'cp' number, the more branches get chopped off.
+# 0.015 is usually the sweet spot for a clean visual
+presentation_tree <- rpart::prune(tree_engine, cp = 0.015)
+#we explicitly call rpart::prune to prevent tidymodels from hijacking it
+
+
+
+#Plotting the tree
+rpart.plot(
+  presentation_tree,
+  main = "Decision Tree: Core Rules for Late-Game NFL Outcomes",
+  type = 4,   #Draws clean branches
+  extra = 104,  #Shows percentages inside the boxes
+  box.palette = c("#FF4136", "#e0f3f8"), #Red for lost game, Blue for Won game
+  shadow.col = "gray",
+  nn = TRUE,
+  tweak = 1.2 #This makes the text 20% larger
+)
+
+```
+
+Looking at the visual of our decision tree that we created, the way we
+read this, starting with the very top node (the root node), where it
+asks, "How much time is left in the game?" The negative numbers (like
+-0.58) likely means that our data was scaled or standardized somewhere
+in the pipeline, so -0.58 just means "below average time remaining". If
+the time remaining is below that threshold, the tree immediately drops
+down the left branch and predicts a lost game with 79% confidence.
+
+If a team survives that first split (meaning that they have enough time
+left on the clock), the tree moves to the right and immediately asks the
+next most important question: "What's the score" (`score_differential`).
+If the score differential is high enough (\>= 1.3), it drops down to the
+far right branch and predicts a Won Game with 82% confidence. But if the
+score is closer, then it creates a few more complex splits based on
+exact score margins.
+
+### Decision Tree Tuning Performance:
+
+As seen in our pruned decision tree, the foundational rules defining a
+win or a loss rely strictly on game context (time and score).
+Play-calling style however was not significant enough to be included in
+the model's primary decision, since it's a secondary factor.
+
+```{R}
+
+library(ggplot2)
+
+# Generate the autoplot for the Decision Tree tuning results
+autoplot(tree_tune_results) +
+  labs(
+    title = "Decision Tree Tuning Performance",
+    subtitle = "How Cost Complexity and Tree Depth affect Model Accuracy and AUC",
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+```
+
+This model ultimately showcases our behind the scenes math of how our
+decision tree learned to stop underfitting without accidentally crossing
+the line into overfitting.
+
+The bottom orange/brown lines represent very shallow trees (Tree Depth
+of 1 or 2). They didn't do too hot because they are too simple
+(underfitting). A tree with only one split can't possibly understand the
+complexities of an NFL football game.
+
+The lines grouped closely together at the very top (the purple, pink,
+and light blue lines) represent deep trees (consists of a tree depth of
+10, 11, 13, 15). This visually proves that predicting late-game play
+calls requires a highly layered complex set of conditional rules.
+
+Looking at the left side of this graph, the penalty is tiny (1e -08).
+That means the tree is allowed to grow as wild and deep as it wants,
+which is why performance is high and stable.
+
+But looking at what happened when the penalty reaches (1e -02) on the
+right side. Every single line falls off a massive cliff! When the
+cost-complexity penalty got too strict, the algorithm essentially took a
+chainsaw to our tree. It aggressively chopped off so many branches that
+the deep trees were forced to become simple trees, destroying their
+predictive power and causing the AUC to plummet.
+
+## Random Forest Model:
+
+Now our final model that we plan on creating is a random forest model:
+Model tuning (also known as hyperparameter tuning) is what I attempted
+to use for my random forest model. We would use this for a non default
+setting. Tuning is the process of having the computer test dozens of
+different settings (like how many variables the tree is allowed to look
+at, or how deep the tree is allowed to grow) to find the absolute
+mathematically optimal version of our model.
+
+```{R}
+# 1. Specify the Random Forest model
+rf_spec <- rand_forest(
+  mtry = tune(), 
+  trees = tune(), 
+  min_n = tune()
+  ) %>%
+  
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# 2. Bundle the recipe and model into a workflow
+rf_workflow <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(nfl_recipe)
+
+# 3. Set up a tuning grid (trying different combinations of mtry and min_n)
+#While also including the trees range
+rf_grid <- grid_regular(
+  mtry(range = c(1, 5)), 
+  trees(range = c(300,600)), 
+  min_n(range = c(2, 10)),
+  levels = 5
+)
+
+#This will take a while!
+#Because we have 2 parameters, and levels = 5
+#This means the grid is testing 5 * 5 * 5 = 125 different forest combinations
+#Across our 5 cross-validation folds, the computer is actively building and grading 625 different models!
+
+# Set seed for reproducibility
+set.seed(2025)
+
+```
+
+Unlike a single decision tree, which is highly prone to overfitting to
+specific game scenarios, a random forest model builds an entire "wisdom
+of the crowd" ensemble. It generates hundreds of distinct decision trees
+and aggregates their predictions, resulting in a highly robust and
+mathematically stable model capable of navigating the unpredictable
+nature of football!
+
+`mtry:` (1 to 5): This controls how many random predictors the model is
+allowed to look at before making a split. By forcing the trees to
+occasionally ignore dominant variables (like the score differential or
+the clock), the model is forced to uncover the hidden value in secondary
+variables, such as our specific `play_style` calls.
+
+`trees:` (300 to 600): This defines the sheer size of the forest. I
+didn't want to expand my forest greater than this amount because going
+for an infinitely large forest is computationally expensive and
+mathematically unnecessary. Eventually the model will reach it's peak
+performance and can no longer improve the Area Under the Curve (AUC).
+Which was why I opted to test a tuning range of 300 to 600 trees.
+
+`min_n:` (2 to 10: This dictates the minimum number of plays required in
+a node before the tree is allowed to split again, acting as a natural
+brake against overly complex, over-fitted rules.
+
+```{R}
+
+# Run the tuning process
+rf_tune_results <- tune_grid(
+  rf_workflow,
+  resamples = data_folds,
+  grid = rf_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# View the results!
+show_best(rf_tune_results, metric = "roc_auc")
+
+```
+
+```{R}
+#Extract the best combination of mtry, min_n, and trees
+best_rf_params <- select_best(rf_tune_results, metric = "roc_auc")
+
+#Plug those perfect parameters back into the workflow
+rf_final_workflow <- finalize_workflow(
+  rf_workflow,
+  best_rf_params
+)
+
+#Fit the finalized workflow to the testing data
+rf_final_fit <- last_fit(
+  rf_final_workflow,
+  split = data_split
+)
+
+# 4. View the ultimate test metrics!
+collect_metrics(rf_final_fit)
+
+```
+
+Looking at our ROC_AUC values for our tuned random forest model, we can
+see that we get approximately a value of 0.835. This is the most
+important metric for classification models, more specifically it
+measures our model's ability to distinguish between a win and a loss.
+Sports data in general can be notoriously noisy and unpredictable, so
+building a model that score that high on completely unseen testing data
+means that we found a very real, very strong signal in our data! Looks
+like we found our winning model!
+
+Having an ROC_AUC of 0.835 means that if we randomly select one
+late-game situation where the team eventually won, and one where they
+lost, our random forest will correctly identify the winning situation
+83.5% of the time.
+
+Looking at the accuracy score, out of the 431 plays within the unseen
+testing dataset, our model correctly predicted the final outcome of the
+game 78% of the time based purely on our predictors (`play_style`,
+`yardline`, `score_differential`, etc).
+
+A brier class measures the confidence of our model's predictions (where
+0 is perfect and 0.25 is random guessing for balanced data). A brier
+class score of 0.149 means that when our model predicts a win, it is
+highly confident in that prediction, rather than just barely scraping by
+with a 51% probability.
+
+### ROC Curve: Random Forest
+
+```{R}
+library(vip)
+library(ggplot2)
+
+# PLOT THE ROC CURVE
+roc_plot <- collect_predictions(rf_final_fit) %>%
+  roc_curve(truth = won_game, `.pred_Won Game`, event_level = "second") %>% 
+  # Change .pred_Win to .pred_Loss if your positive class is Loss
+  # event_level = "second" to stop the curve from inverting
+  autoplot() +
+  labs(
+    title = "ROC Curve: Random Forest",
+    subtitle = "Final Test Data Performance (AUC: 0.835)"
+  ) +
+  theme_minimal()
+
+print(roc_plot)
+```
+
+The dotted line is basically representing an AUC of 0.50 but the solid
+black line is our random forest model. The fact that our curve bows so
+far up toward the top-left corner is the visual proof of our outstanding
+0.835 AUC score. Which ultimately shows how much "smarter" our model is
+than just randomly guessing. In sports analytics, predicting outcomes is
+notoriously difficult because games involve so much luck and human
+error. What this ROC curve proves is that late-game NFL success isn't
+just random luck, but our predictors (score_differential, yardline,
+playstyle, etc.) contain a very real mathematically provable signal that
+dictates who wins the game.
+
+### Random Forest Plot
+
+```{R}
+
+library(ggplot2)
+
+# Generate the autoplot for the Random Forest tuning results
+autoplot(rf_tune_results, metric = "roc_auc") #+
+#  labs(
+#    title = "Random Forest Tuning Performance",
+#    subtitle = "Optimizing Predictors (mtry), Tree Depth (min_n), and Number of Trees",
+#    color = "Minimal Node Size (min_n)"
+#  ) +
+#  theme_minimal(base_size = 11) +
+#  theme(
+#    plot.title = element_text(face = "bold"),
+#    legend.position = "right"
+#  )
+
+
+```
+
+Looking at this faceted plot, this graph is essentially the map that
+proves exactly how our random forest reached that 0.835 AUC. The steep
+climb of mtry (the x-axis). Our lines start way down near 0.75 when the
+number of randomly selected predictors is at 1, but then shoot up
+drastically when it moves to 2, 3, 4, and 5. What this means is if we
+force the random forest to only look at 1 variable per split, it
+performs terribly. It needs to look at a wider "menu" of variables (like
+time, score, and yardline) simultaneously to make smart decisions about
+NFL play calls.
+
+The clustered lines are the number of trees. The different colored lines
+appear to be tightly packed. Looking at the minimal node size 4, we can
+see that our champion model is that olive green dot located at the far
+right (olive green represents 375 trees). So this is when we have an
+mtry = 5, trees = 375, and min_n = 4. It was the one that gave us that
+outstanding ROC_AUC mean score of 0.7931060
+
+This model is also really robust, because if we look at all five boxes,
+they look very similar. No matter how much the min_n value range shifts,
+the AUC stays within that 0.78 - 0.79 range.
+
+### Variable Importance Plot:
+
+```{R}
+
+#Plotting the variable importance
+vip_plot <- rf_final_fit %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "col", num_features = 10, mapping = aes(fill = Variable)) +
+  labs(
+    title = "Random Forest: Variable Importance",
+    subtitle = "Which factors most heavily influenced the game's outcome?",
+    x = "Importance Score",
+    y = "Predictor Variable"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(vip_plot)
+
+
+```
+
+From what we can see, `game_seconds_remaining`, `score_differential`,
+and `yardline_100` are the ultimate predictors of whether a team wins or
+loses. This makes a lot of sense because if my team is up by 7 points
+with 30 seconds left on my opponent's 10 yard line, then my team is
+going to win regardless of what play that I call. The situation dictates
+the outcome far more than the play itself.
+
+The plot twist though to all of this is that the play styles don't
+really matter. There is no universally "good" or "bad" play style.
+Aggressive play calling isn't inherently better than conservative play
+calling. The success of the play style is entirely dependent on the "Big
+Three" variables above it. What the random forest model determined for
+us is it learned than a conservative play is a winning play if the time
+and score are right, and a losing play if they aren't.
+
+`ydstogo` and `down` sit firmly in the middle. They matter more than the
+specific play call but they are still heavily overshadowed by how much
+time is left on the clock and what the score is. `Catastrophic_failure`
+is surprisingly really low though, considering a fumble or an
+interception usually ruins a game. But in machine learning, variable
+importance measures how useful a variable is across all rows of data.
+Because catastrophic failures are rare (they tend to not happen on every
+single play), the model relies much more heavily on variables that exist
+on every single play (like the clock and the yardline) to make its
+overall predictions.
+
+### Random Forest Confusion Matrix:
+
+```{R}
+
+# Generate a Confusion Matrix for the champion Random Forest
+rf_final_fit %>%
+  collect_predictions() %>%
+  conf_mat(truth = won_game, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = "Confusion Matrix: Random Forest",
+    subtitle = "Which outcomes are the hardest to predict?"
+  )
+
+```
+
+This model in particular is really good at identifying losing situations
+(258). When it sees a team that is likely to lose, then it's almost
+always right. The model also successfully identified 79 winning
+situations. The bottom left corner indicates false wins (50). These are
+50 plays where the model predicted a "Win", but the team actually lost.
+In football terms, these are likely the "heartbreak" games or the teams
+that had such a high probability of winning on the score and time, but
+absolutely blew it (because of maybe costly turnovers and missed field
+goals). The top right corner identifies false losses (44). These are 44
+plays where the model predicted a "Loss", but the team actually won.
+These are essentially the "miracle" games or the incredible comebacks
+that defied the typical statistical rules of the game.
+
+The Confusion Matrix reveals that while the model is highly proficient
+at identifying clear losing scenarios (84% accuracy), it is more
+challenged by winning scenarios (64%). This suggests that late game NFL
+wins often involve 'miracle' outliers or unpredictable shifts that fall
+outside the standard patterns learned by the random forest, whereas
+losing paths are more statistically predictable.
+
+# THE ULTIMATE TEST!!!
+
+![](images/49ers%20players%20huddling%20up-01.webp)
+
+Imagine this: It's the two-minute warning
+(`game_seconds_remaining = 120`). Your team is down by exactly a field
+goal (`score_differential = -3`). You have the ball right at midfield
+(`yardline_100 = 50`) on 1st and 10 (`down = 1, ydstogo = 10`). The home
+crowd is electric, the season is on the line! What type of play do you
+call??
+
+```{R}
+library(tidymodels)
+
+
+#Fit the finalized workflow to our clean training data
+deployment_model <- fit(rf_final_workflow, data = train_data_clean)
+
+
+
+# 1. Create the exact scenarios
+# We use c() to create two identical rows, but flip the play style
+hypothetical_scenarios <- tibble(
+  score_differential = c(-3, -3), #3 point deficit
+  game_seconds_remaining = c(120, 120), #120 seconds remaining
+  ydstogo = c(10, 10), #10 yards to go
+  yardline_100 = c(50, 50), #at 50 yard line
+  down = c(1, 1), #on a first down
+  
+  # Passing "0" as a string prevents R from getting confused about factor levels
+  catastrophic_failure = factor(c("0", "0"), levels = c("0", "1")),
+  
+  # The recipe's step_string2factor will handle this for us automatically now!
+  play_style = c("Aggressive", "Conservative") 
+)
+
+
+#Predict the probabilities
+
+# We use type = "prob" to get the actual percentages
+win_probabilities <- predict(deployment_model, new_data = hypothetical_scenarios, type = "prob")
+
+# 4. Bind the results together
+final_results <- bind_cols(hypothetical_scenarios, win_probabilities)
+
+# 5. View the final side-by-side comparison!
+final_results %>%
+  select(play_style, starts_with(".pred_Won"))
+
+
+```
+
+Here are the results!! If you went for an aggressive play, you would
+have a 5.4% chance of winning the game. Attempting a "hero play" (an
+immediate long pass for a TD for instance) is really risky, but really
+epic if done successfully. Technically speaking, when that team only
+needs a field goal to tie the game because they are down by 3, there is
+no reason for them to go for an aggressive pass, especially if it's
+first down.
+
+But if you chose conservative, then you are great at calling plays! The
+model predicts a 34.8% win probability. This is the right choice in this
+situation, because you're only down by 3, and it's first down. I would
+opt for a run play to try and get extra yardage.
+
+## New Scenario!
+
+Now we have cranked the pressure up to a terrifying level! There is now
+only one minute left on the clock (`game_seconds_remaining = 120`). You
+are still down by 3 points (`score_differential = -3`). You have driven
+down to the opponent's 20 yard line (`yardline_100 = 20`), but the drive
+has stalled. It is 4th and 5! (`down = 4, ydstogo = 5`). If you don't
+convert, the game is offically over! Do you go for it, or kick the field
+goal to take the points (which could be considered conservative)?
+
+```{R}
+
+
+# 1. Create the NEW High-Pressure Scenario
+hypothetical_scenarios_2 <- tibble(
+  score_differential = c(-3, -3),        # Still down by 3 points
+  game_seconds_remaining = c(60, 60),    # ONLY 1 MINUTE LEFT!
+  ydstogo = c(5, 5),                     # 5 yards to get the 1st down
+  yardline_100 = c(20, 20),              # On the opponent's 20-yard line (Red Zone)
+  down = c(4, 4),                        # 4TH DOWN (Do or Die!)
+  
+  # These stay exactly the same for the model to work
+  catastrophic_failure = factor(c("0", "0"), levels = c("0", "1")),
+  play_style = c("Aggressive", "Conservative") 
+)
+
+# 2. Predict the probabilities using your deployed model!
+win_probabilities_2 <- predict(deployment_model, new_data = hypothetical_scenarios_2, type = "prob")
+
+# 3. Bind the results together
+final_results_2 <- bind_cols(hypothetical_scenarios_2, win_probabilities_2)
+
+# 4. View the final side-by-side comparison!
+final_results_2 %>%
+  select(play_style, down, ydstogo, starts_with(".pred_Won"))
+
+
+```
+
+Even with the situation of do or die, our random forest model still
+firmly believes that a conservative play call (\~35.9% win probability)
+is significantly better than an aggressive play call (\~27.7% win
+probability)! For a conservative play case, a coach can call a quick
+5-yard slant, a check-down, or a gritty run play to simply get the first
+down and move the chains. But if going aggressive, then that coach
+really wants to score a touchdown, even though they can get a first down
+five yards away, but they have to be mindful that mistakes are more
+likely with a play like this.
+
+## Final Scenario
+
+Now finally, let's say we have a third and long scenario
+(`down = 3, ydstogo = 11`). The situation is dire, your team is down by
+a full touchdown (`score_differential = -7`) with a mere 45 seconds
+remaining (`game_seconds_remaining = 45`). What would you do??
+
+```{R}
+
+# 1. "3rd and Long" Desperation Scenario
+hypothetical_scenarios_3 <- tibble(
+  score_differential = c(-7, -7),        # Down by a full touchdown (7 points)
+  game_seconds_remaining = c(45, 45),    # Only 45 seconds left on the clock
+  ydstogo = c(11, 11),                   # 11 yards needed to move the chains
+  yardline_100 = c(35, 35),              # On the opponent's 35-yard line (Fringe Field Goal Range)
+  down = c(3, 3),                        # 3RD DOWN
+  
+  # These stay exactly the same for the model to work
+  catastrophic_failure = factor(c("0", "0"), levels = c("0", "1")),
+  play_style = c("Aggressive", "Conservative") 
+)
+
+# 2. Predict the probabilities using your deployed model
+win_probabilities_3 <- predict(deployment_model, new_data = hypothetical_scenarios_3, type = "prob")
+
+# 3. Bind the results together
+final_results_3 <- bind_cols(hypothetical_scenarios_3, win_probabilities_3)
+
+# 4. View the final side-by-side comparison!
+final_results_3 %>%
+  select(play_style, down, ydstogo, starts_with(".pred_Won"))
+
+
+
+```
+
+What our model predicts is 6.2% for an aggressive play call and 18% for
+a conservative play call. Now this one is interesting to talk about.
+Even though your team is so far away from the first down line to keep
+the drive alive and even though the time on the clock is really low, it
+is way more smarter to not go for a hero ball and to try and go for a
+12-yard pass designed to purely get that first down.
+
+This model mathematically confirms that even when trailing by a full
+touchdown with under a minute to play, securing the immediate first down
+is statistically more vital to comeback than attempting a low-percentage
+immediate pass for the end zone.
+
+# Model Results
+
+After testing a diverse gauntlet of machine learning models, we have
+came to a conclusion that the **random forest** model has been crowned
+the champion!
+
+*Linear models* (logistic regression & elastic net) severely underfitted
+the data, with ROC AUC scores between 0.66 and 0.71. These models
+attempt to draw a rigid, straight line through the data. And for a sport
+like American football that involves so many unpredictable play calls,
+linear models simply could not grasp that nuance.
+
+*K-Nearest Neighbors* (KNN) is a distance-based model that greatly
+improved the performance to an ROC AUC score of 0.780, as the model
+succeeded by finding historically similar plays for the outcome. This
+proved that situation and context matter more than isolated variables.
+
+*Decision Trees* excelled at mapping out the "If-Then" conditional logic
+of football. While the basic nontuned tree performed admirably, our
+hyperparameter tuning process significantly boosted its predictive power
+with an ROC AUC score of 0.795. Which allowed the model to find the
+perfect depth without overfitting.
+
+*Random Forest* however, was the ultimate champion model! By aggregating
+the predictions of 375 distinct decision trees, the random forest
+eliminated the variance of a single tree and perfectly captured the
+overlapping realities of NFL strategy. It achieved a high ROC AUC score
+of 0.835 and an accuracy of 78%, proving it was highly capable of
+distinguishing between game-winning and game-losing situations on
+completely unseen data.
+
+# Conclusion
+
+So to conclude, we sought to answer one of the most debated questions in
+football strategy: in high leverage situations, is conservative or
+aggressive play calling more successful in winning big games? By
+analyzing play-by-play data and building a robust machine learning
+pipeline, we moved past coaching intuition and let the math dictate the
+answer.
+
+NFL fans (and often coaches) assume that going for it on 4th down
+requires a high-risk aggressive "hero play" (like a deep pass to the
+endzone). But our model proved that even when a team needs 5 yards to
+get a first down to keep the game alive, throwing a high-risk deep pass
+actually drops your chances of winning by over 8%. The model essentially
+favors the "boring" 6-yard slant or the safe check-down because
+protecting the football and simply moving the chains is always more
+valuable than gambling on a miracle. Therefore I can fairly say, a
+conservative play calling strategy is more often than not the way to go,
+but that doesn't mean you don't have to go for a hero ball to win it
+all! Just ask Caleb Williams!
+
+And just for your guys' pleasure, here is the ultimate definition of a
+"hero-ball" to win a football game! Caleb Williams, quarterback of the
+Chicago Bears, throws a 46 yard dart to DJ Moore who makes an incredible
+catch and they won the game in overtime over the Green Bay Packers!
+
+![](images/Caleb%20Williams%20TD%20pass%20vs%20Packers.gif)
+
+Overall, I really had a lot of fun putting together this project! The
+challenges were definitely there, but when my models were finally able
+to run, it was the most satisfying thing ever! I have always had a huge
+passion for sports, especially for football, and I always wanted to do
+something like this. I really learned a lot about the different models I
+can use to predict. My favorite part was putting together visualizations
+of the data in the EDA section, and seeing the beautifully plotted data
+in a boxplot, barplot, density plots, you name it! I'm definitely
+looking forward to doing more projects like this in the future, and am
+really excited about what the future of sports analytics has for us!
